@@ -9,13 +9,23 @@ from PIL import Image
 import numpy as np
 import os
 
-app = Flask(__name__)
-app.secret_key = 'yoklama123'
+# Heroku varsa DATABASE_URL gelir; yoksa SQLite kullan (ephemeral!)
+db_url = os.environ.get("DATABASE_URL")
+if db_url:
+    if db_url.startswith("postgres://"):
+        db_url = db_url.replace("postgres://", "postgresql://", 1)
+else:
+    db_url = "sqlite:///app.db"  # fallback (dosya tabanı)
 
-# PostgreSQL örneği
-app.config['SQLALCHEMY_DATABASE_URI'] = 'postgresql://emre:1234@localhost/attendance_db'
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+app.config["SQLALCHEMY_DATABASE_URI"] = db_url
+app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+
 db = SQLAlchemy(app)
+
+# Uygulama import edilirken DB yaratma = kötü fikir; crash sebebi olur.
+# Bunu kaldır:
+# with app.app_context():
+#     db.create_all()
 
 class Attendance(db.Model):
     id = db.Column(db.Integer, primary_key=True)
