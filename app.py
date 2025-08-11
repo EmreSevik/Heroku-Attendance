@@ -1,24 +1,26 @@
 # app.py
-from flask import Flask, render_template_string, request, redirect, url_for, flash
+from flask import Flask, render_template_string, request, redirect, url_for, flash, jsonify
 from flask_sqlalchemy import SQLAlchemy
 from datetime import datetime, timedelta
-import pickle, base64, os
+import pickle, os
 from io import BytesIO
 from PIL import Image
 import numpy as np
+import base64  # sadece 'add_user' uploadları için fallback
 import face_recognition
 
 # --- Flask app ---
 app = Flask(__name__)
-app.config["TEMPLATES_AUTO_RELOAD"] = True
 app.secret_key = os.environ.get("SECRET_KEY", "yoklama123")
+app.config["TEMPLATES_AUTO_RELOAD"] = True
+app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024  # 10MB payload limiti
 
 # --- DB URL (Heroku + local fallback) ---
 db_url = os.environ.get("DATABASE_URL")
 if db_url and db_url.startswith("postgres://"):
     db_url = db_url.replace("postgres://", "postgresql://", 1)
 if not db_url:
-    db_url = "sqlite:///app.db"  # add-on yoksa SQLite kullan
+    db_url = "sqlite:///app.db"  # add-on yoksa SQLite kullan (ephemeral)
 
 app.config["SQLALCHEMY_DATABASE_URI"] = db_url
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
@@ -42,15 +44,12 @@ class Attendance(db.Model):
     exit_time = db.Column(db.DateTime)
     duration = db.Column(db.Interval)
 
-# with app.app_context():
-    # db.create_all()
-
 # Sağlık kontrolü
 @app.route("/health")
 def health():
     return "OK", 200
 
-# İlk tablo kurulumu (isteğe bağlı)
+# İlk tablo kurulumu – sadece elle çağır
 @app.route("/initdb")
 def initdb():
     with app.app_context():
@@ -155,10 +154,10 @@ HOME_HTML = f'''
             <div class="cam-card">
               <video id="video" autoplay playsinline></video>
               <div class="mt-3 d-flex gap-2 justify-content-center">
-                <button id="snap" class="btn btn-primary">📸 Fotoğraf Çek</button>
-                <form id="photoForm" method="POST" enctype="multipart/form-data" class="d-inline">
-                  <input type="hidden" name="imgData" id="imgData">
-                  <button type="submit" class="btn btn-success" id="sendBtn" disabled>Kaydet</button>
+                <button id="snap" class="btn btn-primary">📸 Fotoğraf Çek & Kaydet</button>
+                <!-- Form sadece action bilgisini taşımak için var; gönderim fetch ile -->
+                <form id="photoForm" class="d-inline">
+                  <input type="hidden" id="currentAction" value="/attendance_photo">
                 </form>
               </div>
             </div>
@@ -178,41 +177,75 @@ HOME_HTML = f'''
   <script>
     function startCamera(type) {{
       document.getElementById('cameraArea').style.display = 'block';
-      document.getElementById('sendBtn').disabled = true;
-      const form = document.getElementById('photoForm');
-      form.action = (type === 'entrance') ? '/attendance_photo' : '/exit_photo';
 
-      // https gerektirir (Heroku prod'da tamam)
-      navigator.mediaDevices.getUserMedia({{ video: true }})
-        .then(stream => {{
-          const v = document.getElementById('video');
-          v.srcObject = stream;
-        }})
-        .catch(err => {{
-          alert('Kamera erişimi reddedildi: ' + err);
-        }});
+      // action'ı ayarla
+      const act = (type === 'entrance') ? '/attendance_photo' : '/exit_photo';
+      document.getElementById('currentAction').value = act;
+
+      // 640p hedef çözünürlük
+      navigator.mediaDevices.getUserMedia({{
+        video: {{ width: {{ ideal: 640 }}, height: {{ ideal: 360 }}, facingMode: "user" }}
+      }})
+      .then(stream => {{
+        const v = document.getElementById('video');
+        v.srcObject = stream;
+      }})
+      .catch(err => {{
+        alert('Kamera erişimi reddedildi: ' + err);
+      }});
 
       document.getElementById('cameraArea').scrollIntoView({{behavior:'smooth', block:'center'}});
     }}
 
     document.addEventListener('DOMContentLoaded', () => {{
       const snap = document.getElementById('snap');
-      if (snap) {{
-        snap.onclick = function(e) {{
-          e.preventDefault();
-          var canvas = document.createElement('canvas');
-          var video = document.getElementById('video');
-          canvas.width = video.videoWidth || 960;   // 16:9
-          canvas.height = video.videoHeight || 540; // 16:9
-          canvas.getContext('2d').drawImage(video, 0, 0);
-          var dataUrl = canvas.toDataURL('image/png');
-          document.getElementById('imgData').value = dataUrl;
+      if (!snap) return;
+
+      snap.onclick = async function(e) {{
+        e.preventDefault();
+        const video = document.getElementById('video');
+        const W = 640;
+        const vw = video.videoWidth || 960;
+        const vh = video.videoHeight || 540;
+        const H = Math.round(W * vh / vw); // en-boy oranını koru
+
+        const canvas = document.createElement('canvas');
+        canvas.width = W; canvas.height = H;
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(video, 0, 0, W, H);
+
+        // JPEG + kalite düşür (0.7)
+        canvas.toBlob(async (blob) => {{
+          if (!blob) {{
+            alert("Görüntü yakalanamadı.");
+            return;
+          }}
+
+          // Önizleme
           const prev = document.getElementById('preview');
-          prev.src = dataUrl; prev.style.display = 'block';
-          document.getElementById('sendBtn').disabled = false;
-          alert("📸 Fotoğraf çekildi!");
-        }};
-      }}
+          prev.src = URL.createObjectURL(blob);
+          prev.style.display = 'block';
+
+          // FormData + Blob gönder
+          const fd = new FormData();
+          fd.append('photo', blob, 'frame.jpg');
+
+          const url = document.getElementById('currentAction').value;
+
+          try {{
+            const res = await fetch(url, {{ method: 'POST', body: fd }});
+            if (!res.ok) {{
+              const txt = await res.text();
+              alert("Gönderim hatası: " + res.status + " " + txt);
+              return;
+            }}
+            // Başarılı → sayfayı yenile ki flash mesajlarını görelim
+            window.location.href = "/";
+          }} catch (err) {{
+            alert("Ağ hatası: " + err);
+          }}
+        }}, 'image/jpeg', 0.7);
+      }};
     }});
   </script>
   <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
@@ -340,20 +373,31 @@ def dashboard():
 @app.route('/add_user', methods=['GET', 'POST'])
 def add_user():
     if request.method == 'POST':
-        username = request.form['username']
+        username = request.form.get('username', '').strip()
         file = request.files.get('face_image')
+        if not username:
+            flash("İsim zorunlu.")
+            return redirect(url_for('add_user'))
         if not file:
             flash("Fotoğraf yüklenmedi.")
             return redirect(url_for('add_user'))
-        path = f"tmp_{username}.jpg"
-        file.save(path)
-        img = face_recognition.load_image_file(path)
-        face_locs = face_recognition.face_locations(img)
+
+        # Görseli yükle ve encode çıkar
+        try:
+            img = Image.open(file.stream).convert("RGB")
+        except Exception:
+            flash("Görsel okunamadı.")
+            return redirect(url_for('add_user'))
+
+        img_np = np.array(img)
+        face_locs = face_recognition.face_locations(img_np)
         if not face_locs:
-            os.remove(path)
             flash("Yüz algılanamadı.")
             return redirect(url_for('add_user'))
-        enc = face_recognition.face_encodings(img, face_locs)[0]
+
+        enc = face_recognition.face_encodings(img_np, face_locs)[0]
+
+        # Basit pickle veritabanı (ephemeral). Kalıcı istersen tabloya taşıyabiliriz.
         if os.path.exists("face_db.pickle"):
             with open("face_db.pickle", "rb") as f:
                 encodings, names, ids = pickle.load(f)
@@ -365,9 +409,10 @@ def add_user():
         ids.append(new_id)
         with open("face_db.pickle", "wb") as f:
             pickle.dump((encodings, names, ids), f)
-        os.remove(path)
+
         flash(f"Kullanıcı eklendi: {username} (ID: {new_id})")
         return redirect(url_for('add_user'))
+
     return render_template_string(ADD_USER_HTML)
 
 # ----------------- FOTOĞRAF İŞLEME -----------------
@@ -380,18 +425,20 @@ def exit_photo():
     return process_photo(is_entry=False)
 
 def process_photo(is_entry: bool):
-    img_data = request.form.get('imgData')
-    if not img_data:
+    """
+    Yeni yöntem: JPEG Blob (multipart/form-data) bekler: field adı 'photo'
+    """
+    file = request.files.get('photo')
+    if not file:
         flash("Fotoğraf alınamadı.")
         return redirect(url_for('home'))
 
     try:
-        img_bytes = base64.b64decode(img_data.split(',')[1])
+        image = Image.open(file.stream).convert("RGB")
     except Exception:
         flash("Görsel çözümleme hatası.")
         return redirect(url_for('home'))
 
-    image = Image.open(BytesIO(img_bytes)).convert("RGB")
     img_array = np.array(image)
 
     face_locs = face_recognition.face_locations(img_array)
@@ -445,4 +492,4 @@ def process_photo(is_entry: bool):
 if __name__ == '__main__':
     # Lokal geliştirme için. Heroku'da Gunicorn Procfile ile başlatır.
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=port, debug=True)
