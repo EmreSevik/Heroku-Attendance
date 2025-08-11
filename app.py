@@ -79,7 +79,6 @@ BASE_CSS = """
   }
   .sq-in{ background:var(--in); color:#fff; } .sq-in:hover{ background:var(--inH); }
   .sq-out{ background:var(--out); color:#fff; } .sq-out:hover{ background:var(--outH); }
-  .alert{ border-radius:12px; }
 
   /* Kamera alanı: yan yana yerleşim + responsive */
   #cameraArea{ display:none; margin-top:30px; }
@@ -129,7 +128,6 @@ HOME_HTML = f'''
     </nav>
 
     <main class="container py-4">
-
       <!-- Giriş/Çıkış büyük butonlar -->
       <div class="hero">
         <button class="big-square sq-in border-0" onclick="startCamera('entrance')">
@@ -244,7 +242,8 @@ HOME_HTML = f'''
               alert("Gönderim hatası: " + res.status + " " + txt);
               return;
             }}
-            // Başarılı → ana sayfaya dön
+            // ✅ Başarılı: kullanıcıya uyarı ver ve ana sayfaya dön
+            alert('📸 Fotoğraf çekildi.');
             window.location.href = "/";
           }} catch (err) {{
             alert("Ağ hatası: " + err);
