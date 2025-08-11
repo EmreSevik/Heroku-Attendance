@@ -7,11 +7,6 @@ from PIL import Image
 import numpy as np
 import face_recognition
 
-# 🔹 YOLO import + model yükleme
-from ultralytics import YOLO
-YOLO_MODEL_PATH = os.environ.get("YOLO_MODEL", "best.pt")  # repo köküne koyduğun best.pt
-yolo = YOLO(YOLO_MODEL_PATH)
-
 # --- Flask app ---
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "yoklama123")
@@ -64,19 +59,6 @@ def face_confidence(face_distance, match_threshold=0.45):
         value = (linear_val + ((1.0 - linear_val) * pow((linear_val - 0.5) * 2, 0.2)))
         return round(max(0.0, min(1.0, value)) * 100, 2)
 
-# 🔹 YOLO ile yüz tespiti (xyxy + det_conf%)
-def detect_faces_yolo(img_array, conf_thr=0.4, imgsz=640):
-    res = yolo.predict(source=img_array, conf=conf_thr, imgsz=imgsz, verbose=False)
-    boxes = []
-    for r in res:
-        if r.boxes is None:
-            continue
-        for b in r.boxes:
-            x1, y1, x2, y2 = map(int, b.xyxy[0].tolist())
-            det_conf = float(b.conf[0].item()) * 100.0  # %
-            boxes.append((x1, y1, x2, y2, det_conf))
-    return boxes
-
 # Sağlık kontrolü
 @app.route("/health")
 def health():
@@ -114,6 +96,8 @@ BASE_CSS = """
   }
   .sq-in{ background:var(--in); color:#fff; } .sq-in:hover{ background:var(--inH); }
   .sq-out{ background:var(--out); color:#fff; } .sq-out:hover{ background:var(--outH); }
+
+  /* Kamera alanı: yan yana yerleşim + responsive */
   #cameraArea{ display:none; margin-top:30px; }
   .cam-row{ gap:1.25rem; }
   .cam-card{
@@ -124,6 +108,8 @@ BASE_CSS = """
     border-radius:12px; width:100%; height:auto;
     aspect-ratio:16/9; object-fit:cover; max-height:420px;
   }
+
+  /* (Görsel) Flaş efekti */
   #flashEffect{
     display:none; position:fixed; inset:0; background:#fff; z-index:9999; opacity:1;
     animation: flash-pop .25s ease;
@@ -159,6 +145,7 @@ HOME_HTML = f'''
     </nav>
 
     <main class="container py-4">
+      <!-- Giriş/Çıkış büyük butonlar -->
       <div class="hero">
         <button class="big-square sq-in border-0" onclick="startCamera('entrance')">
           <div class="text-center">
@@ -174,19 +161,24 @@ HOME_HTML = f'''
         </button>
       </div>
 
+      <!-- Kamera Alanı (YAN YANA) -->
       <div id="cameraArea" class="container" style="display:none; margin-top:30px;">
         <div class="row cam-row justify-content-center align-items-start">
+          <!-- Sol: Canlı Kamera -->
           <div class="col-12 col-lg-5">
             <div class="cam-card">
               <video id="video" autoplay playsinline></video>
               <div class="mt-3 d-flex gap-2 justify-content-center">
                 <button id="snap" class="btn btn-primary">📸 Fotoğraf Çek & Kaydet</button>
+                <!-- Form sadece action bilgisini taşımak için var; gönderim fetch ile -->
                 <form id="photoForm" class="d-inline">
                   <input type="hidden" name="action" id="currentAction" value="/attendance_photo">
                 </form>
               </div>
             </div>
           </div>
+
+          <!-- Sağ: Önizleme -->
           <div class="col-12 col-lg-5">
             <div class="cam-card">
               <img id="preview" src="" style="display:none;">
@@ -200,9 +192,12 @@ HOME_HTML = f'''
   <script>
     function startCamera(type) {{
       document.getElementById('cameraArea').style.display = 'block';
+
+      // action'ı ayarla
       const act = (type === 'entrance') ? '/attendance_photo' : '/exit_photo';
       document.getElementById('currentAction').value = act;
 
+      // 640p hedef çözünürlük
       navigator.mediaDevices.getUserMedia({{
         video: {{ width: {{ ideal: 640 }}, height: {{ ideal: 360 }}, facingMode: "user" }}
       }})
@@ -227,33 +222,47 @@ HOME_HTML = f'''
         const W = 640;
         const vw = video.videoWidth || 960;
         const vh = video.videoHeight || 540;
-        const H = Math.round(W * vh / vw);
+        const H = Math.round(W * vh / vw); // en-boy oranını koru
 
         const canvas = document.createElement('canvas');
         canvas.width = W; canvas.height = H;
         const ctx = canvas.getContext('2d');
         ctx.drawImage(video, 0, 0, W, H);
 
+        // Görsel flaş efekti
         const fx = document.getElementById('flashEffect');
         fx.style.display = 'block';
         setTimeout(() => fx.style.display = 'none', 200);
 
+        // JPEG + kalite düşür (0.7)
         canvas.toBlob(async (blob) => {{
-          if (!blob) {{ alert("Görüntü yakalanamadı."); return; }}
-          const prev = document.getElementById('preview');
-          prev.src = URL.createObjectURL(blob); prev.style.display = 'block';
+          if (!blob) {{
+            alert("Görüntü yakalanamadı.");
+            return;
+          }}
 
-          const fd = new FormData(); fd.append('photo', blob, 'frame.jpg');
+          // Önizleme
+          const prev = document.getElementById('preview');
+          prev.src = URL.createObjectURL(blob);
+          prev.style.display = 'block';
+
+          // FormData + Blob gönder
+          const fd = new FormData();
+          fd.append('photo', blob, 'frame.jpg');
+
           const url = document.getElementById('currentAction').value;
 
           try {{
             const res = await fetch(url, {{ method: 'POST', body: fd }});
             const ct = res.headers.get('content-type') || '';
             if (!res.ok) {{
-              const txt = await res.text(); alert("Gönderim hatası: " + res.status + " " + txt); return;
+              const txt = await res.text();
+              alert("Gönderim hatası: " + res.status + " " + txt);
+              return;
             }}
             if (ct.includes('application/json')) {{
               const data = await res.json();
+              // ✅ Sonucu kullanıcıya göster
               if (data && data.name) {{
                 alert('📸 ' + (data.action || 'İşlem') + ' → ' + data.name);
               }} else {{
@@ -262,8 +271,11 @@ HOME_HTML = f'''
             }} else {{
               alert('📸 Fotoğraf çekildi.');
             }}
+            // Ana sayfaya dön
             window.location.href = "/";
-          }} catch (err) {{ alert("Ağ hatası: " + err); }}
+          }} catch (err) {{
+            alert("Ağ hatası: " + err);
+          }}
         }}, 'image/jpeg', 0.7);
       }};
     }});
@@ -391,29 +403,20 @@ def add_user():
         if not file:
             return redirect(url_for('add_user'))
 
-        # Görseli yükle
+        # Görseli yükle ve encode çıkar
         try:
             img = Image.open(file.stream).convert("RGB")
         except Exception:
             return redirect(url_for('add_user'))
 
         img_np = np.array(img)
-
-        # 🔹 Yüzü YOLO ile bul (en güvenilir kutuyu seç)
-        boxes = detect_faces_yolo(img_np, conf_thr=0.35, imgsz=640)
-        if not boxes:
+        face_locs = face_recognition.face_locations(img_np)
+        if not face_locs:
             return redirect(url_for('add_user'))
-        # en yüksek det_conf olan kutu
-        x1, y1, x2, y2, detc = max(boxes, key=lambda b: b[4])
 
-        # face_recognition için (top, right, bottom, left) formatı
-        fr_loc = [(y1, x2, y2, x1)]
-        encs = face_recognition.face_encodings(img_np, known_face_locations=fr_loc)
-        if not encs:
-            return redirect(url_for('add_user'))
-        enc = encs[0]
+        enc = face_recognition.face_encodings(img_np, face_locs)[0]
 
-        # Basit pickle veritabanı (ephemeral)
+        # Basit pickle veritabanı (ephemeral). Kalıcı istersen tabloya taşıyabiliriz.
         if os.path.exists("face_db.pickle"):
             with open("face_db.pickle", "rb") as f:
                 encodings, names, ids = pickle.load(f)
@@ -441,7 +444,7 @@ def exit_photo():
 
 def process_photo(is_entry: bool):
     """
-    JPEG Blob (multipart/form-data) bekler: field adı 'photo'
+    Yeni yöntem: JPEG Blob (multipart/form-data) bekler: field adı 'photo'
     JSON döner: {status, action, name, confidence, recognized, person_id?}
     """
     file = request.files.get('photo')
@@ -454,18 +457,18 @@ def process_photo(is_entry: bool):
         return jsonify({"status": "error", "message": "Invalid image"}), 400
 
     img_array = np.array(image)
-    action_text = "Giriş" if is_entry else "Çıkış"
 
-    # 🔹 YOLO ile yüz tespiti
-    boxes = detect_faces_yolo(img_array, conf_thr=0.4, imgsz=640)
-    if not boxes:
+    face_locs = face_recognition.face_locations(img_array)
+    if not face_locs:
         return jsonify({
             "status": "ok",
-            "action": action_text,
+            "action": "Görüntü",
             "name": "Yüz bulunamadı",
             "confidence": 0.0,
             "recognized": False
         }), 200
+
+    face_enc = face_recognition.face_encodings(img_array, face_locs)[0]
 
     if not os.path.exists("face_db.pickle"):
         return jsonify({
@@ -479,60 +482,52 @@ def process_photo(is_entry: bool):
     with open("face_db.pickle", "rb") as f:
         known_encodings, known_names, known_ids = pickle.load(f)
 
+    # Eşik (tolerance) ve confidence uyumlu
     tolerance = 0.45
-    best = None
+    distances = face_recognition.face_distance(known_encodings, face_enc)
 
-    for (x1, y1, x2, y2, det_conf) in boxes:
-        # face_recognition için (top, right, bottom, left)
-        fr_loc = [(y1, x2, y2, x1)]
-        encs = face_recognition.face_encodings(img_array, known_face_locations=fr_loc)
-        if not encs:
-            continue
-
-        distances = face_recognition.face_distance(known_encodings, encs[0])
-        if len(distances) == 0:
-            continue
-
-        idx = int(np.argmin(distances))
-        dist = float(distances[idx])
-        rec_conf = face_confidence(dist, match_threshold=tolerance)  # % değer
-
-        if (best is None) or (rec_conf > best["rec_conf"]):
-            best = {"idx": idx, "dist": dist, "rec_conf": rec_conf, "det_conf": det_conf}
-
-    if not best:
+    if len(distances) == 0:
         return jsonify({
             "status": "ok",
-            "action": action_text,
-            "name": "Unknown (0%)",
+            "action": "Görüntü",
+            "name": "Kayıtlı kişi yok",
             "confidence": 0.0,
             "recognized": False
         }), 200
 
-    is_match = best["dist"] <= tolerance
-    name_only = known_names[best["idx"]]
+    best_idx = int(np.argmin(distances))
+    best_dist = float(distances[best_idx])
+    conf = face_confidence(best_dist, match_threshold=tolerance)  # % değer
+
+    is_match = best_dist <= tolerance
+    action_text = "Giriş" if is_entry else "Çıkış"
 
     if is_match:
-        person_id = known_ids[best["idx"]]
+        name_only = known_names[best_idx]
+        person_id = known_ids[best_idx]
         now = datetime.now()
 
+        # 2 saat kuralı
         last_record = Attendance.query.filter_by(person_id=person_id).order_by(Attendance.entry_time.desc()).first()
         if last_record and (
             (is_entry and last_record.entry_time and (now - last_record.entry_time) < timedelta(hours=2)) or
             ((not is_entry) and last_record.exit_time and (now - last_record.exit_time) < timedelta(hours=2))
         ):
+            # Eşleşme var ama tekrar işlem
             return jsonify({
                 "status": "ok",
                 "action": action_text,
-                "name": f"{name_only} ({best['rec_conf']}%) - det:{best['det_conf']:.1f}% - Tekrarlı işlem engellendi",
-                "confidence": best["rec_conf"],
+                "name": f"{name_only} ({conf}%) - Tekrarlı işlem engellendi",
+                "confidence": conf,
                 "recognized": True,
                 "person_id": person_id
             }), 200
 
+        # Kayıt yaz
         if is_entry:
             yeni = Attendance(person_id=person_id, name=name_only, entry_time=now)
-            db.session.add(yeni); db.session.commit()
+            db.session.add(yeni)
+            db.session.commit()
         else:
             if last_record and last_record.exit_time is None:
                 last_record.exit_time = now
@@ -542,18 +537,19 @@ def process_photo(is_entry: bool):
         return jsonify({
             "status": "ok",
             "action": action_text,
-            "name": f"{name_only} ({best['rec_conf']}%) - det:{best['det_conf']:.1f}%",
-            "confidence": best["rec_conf"],
+            "name": f"{name_only} ({conf}%)",
+            "confidence": conf,
             "recognized": True,
             "person_id": person_id
         }), 200
 
     else:
+        # Eşleşme yok
         return jsonify({
             "status": "ok",
             "action": action_text,
-            "name": f"Unknown ({best['rec_conf']}%) - det:{best['det_conf']:.1f}%",
-            "confidence": best["rec_conf"],
+            "name": f"Unknown ({conf}%)",
+            "confidence": conf,
             "recognized": False
         }), 200
 
