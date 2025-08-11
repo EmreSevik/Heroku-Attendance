@@ -1,25 +1,26 @@
 from flask import Flask, render_template_string, request, redirect, url_for, flash
 from flask_sqlalchemy import SQLAlchemy
 from datetime import datetime, timedelta
-import pickle
-import face_recognition
-import base64
+import pickle, base64, os
 from io import BytesIO
 from PIL import Image
 import numpy as np
-import os
+import face_recognition
 
-# Heroku varsa DATABASE_URL gelir; yoksa SQLite kullan (ephemeral!)
+# --- DB URL (Heroku + local fallback) ---
 db_url = os.environ.get("DATABASE_URL")
-if db_url:
-    if db_url.startswith("postgres://"):
-        db_url = db_url.replace("postgres://", "postgresql://", 1)
-else:
-    db_url = "sqlite:///app.db"  # fallback (dosya tabanı)
+if db_url and db_url.startswith("postgres://"):
+    db_url = db_url.replace("postgres://", "postgresql://", 1)
+if not db_url:
+    db_url = "sqlite:///app.db"  # add-on yoksa SQLite kullan
 
+# --- Flask app ---
+app = Flask(__name__)
+app.secret_key = os.environ.get("SECRET_KEY", "yoklama123")
 app.config["SQLALCHEMY_DATABASE_URI"] = db_url
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
+# --- DB ---
 db = SQLAlchemy(app)
 
 # Uygulama import edilirken DB yaratma = kötü fikir; crash sebebi olur.
