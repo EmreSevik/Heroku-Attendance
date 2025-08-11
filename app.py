@@ -1,5 +1,5 @@
 # app.py
-from flask import Flask, render_template_string, request, redirect, url_for, flash
+from flask import Flask, render_template_string, request, redirect, url_for
 from flask_sqlalchemy import SQLAlchemy
 from datetime import datetime, timedelta
 import pickle, os
@@ -93,7 +93,7 @@ BASE_CSS = """
     aspect-ratio:16/9; object-fit:cover; max-height:420px;
   }
 
-  /* Flaş efekti */
+  /* (Görsel) Flaş efekti */
   #flashEffect{
     display:none; position:fixed; inset:0; background:#fff; z-index:9999; opacity:1;
     animation: flash-pop .25s ease;
@@ -129,27 +129,6 @@ HOME_HTML = f'''
     </nav>
 
     <main class="container py-4">
-      {{% with messages = get_flashed_messages() %}}
-        {{% if messages %}}
-          <!-- Bootstrap alert (ilk mesajı göster) -->
-          <div class="alert alert-success alert-dismissible fade show" role="alert">
-            {{{{ messages[0] }}}}
-            <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
-          </div>
-          <!-- JS alert + flaş efekt -->
-          <script>
-            (function(){{
-              const msgs = {messages_json};
-              const fx = document.getElementById('flashEffect');
-              msgs.forEach(m => {{
-                fx.style.display = 'block';
-                setTimeout(() => fx.style.display = 'none', 200);
-                alert(m);
-              }});
-            }})();
-          </script>
-        {{% endif %}}
-      {{% endwith %}}
 
       <!-- Giriş/Çıkış büyük butonlar -->
       <div class="hero">
@@ -235,7 +214,7 @@ HOME_HTML = f'''
         const ctx = canvas.getContext('2d');
         ctx.drawImage(video, 0, 0, W, H);
 
-        // Anında flaş efekti
+        // Görsel flaş efekti
         const fx = document.getElementById('flashEffect');
         fx.style.display = 'block';
         setTimeout(() => fx.style.display = 'none', 200);
@@ -265,7 +244,7 @@ HOME_HTML = f'''
               alert("Gönderim hatası: " + res.status + " " + txt);
               return;
             }}
-            // Başarılı → sayfayı yenile ki flash mesajlarını görelim
+            // Başarılı → ana sayfaya dön
             window.location.href = "/";
           }} catch (err) {{
             alert("Ağ hatası: " + err);
@@ -277,8 +256,7 @@ HOME_HTML = f'''
   <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
 </body>
 </html>
-'''.replace("{messages_json}", "{{ messages|tojson }}")
-# replace ile Jinja içi JSON kullanımı için küçük hack
+'''
 
 # ----------------- DASHBOARD -----------------
 DASHBOARD_HTML = f'''
@@ -357,15 +335,6 @@ ADD_USER_HTML = f'''
     </nav>
 
     <main class="container py-4">
-      {{% with messages = get_flashed_messages() %}}
-        {{% if messages %}}
-          <div class="alert alert-success alert-dismissible fade show" role="alert">
-            {{{{ messages[0] }}}}
-            <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
-          </div>
-        {{% endif %}}
-      {{% endwith %}}
-
       <div class="card p-4" style="background:#fff; border:1px solid #e6eefc; border-radius:16px;">
         <h3 class="mb-3">Add New User</h3>
         <form method="post" enctype="multipart/form-data">
@@ -403,23 +372,19 @@ def add_user():
         username = request.form.get('username', '').strip()
         file = request.files.get('face_image')
         if not username:
-            flash("İsim zorunlu.")
             return redirect(url_for('add_user'))
         if not file:
-            flash("Fotoğraf yüklenmedi.")
             return redirect(url_for('add_user'))
 
         # Görseli yükle ve encode çıkar
         try:
             img = Image.open(file.stream).convert("RGB")
         except Exception:
-            flash("Görsel okunamadı.")
             return redirect(url_for('add_user'))
 
         img_np = np.array(img)
         face_locs = face_recognition.face_locations(img_np)
         if not face_locs:
-            flash("Yüz algılanamadı.")
             return redirect(url_for('add_user'))
 
         enc = face_recognition.face_encodings(img_np, face_locs)[0]
@@ -437,7 +402,6 @@ def add_user():
         with open("face_db.pickle", "wb") as f:
             pickle.dump((encodings, names, ids), f)
 
-        flash(f"Kullanıcı eklendi: {username} (ID: {new_id})")
         return redirect(url_for('add_user'))
 
     return render_template_string(ADD_USER_HTML)
@@ -457,26 +421,22 @@ def process_photo(is_entry: bool):
     """
     file = request.files.get('photo')
     if not file:
-        flash("Fotoğraf alınamadı.")
         return redirect(url_for('home'))
 
     try:
         image = Image.open(file.stream).convert("RGB")
     except Exception:
-        flash("Görsel çözümleme hatası.")
         return redirect(url_for('home'))
 
     img_array = np.array(image)
 
     face_locs = face_recognition.face_locations(img_array)
     if not face_locs:
-        flash("Yüz algılanamadı.")
         return redirect(url_for('home'))
 
     face_enc = face_recognition.face_encodings(img_array, face_locs)[0]
 
     if not os.path.exists("face_db.pickle"):
-        flash("Yüz veritabanı yok.")
         return redirect(url_for('home'))
 
     with open("face_db.pickle", "rb") as f:
@@ -495,26 +455,17 @@ def process_photo(is_entry: bool):
             (is_entry and last_record.entry_time and (now - last_record.entry_time) < timedelta(hours=2)) or
             (not is_entry and last_record.exit_time and (now - last_record.exit_time) < timedelta(hours=2))
         ):
-            flash(f"{name}, 2 saat içinde tekrar kayıt yapılamaz.")
             return redirect(url_for('home'))
 
         if is_entry:
-            # Kayıt + İSİMLİ ALERT MESAJI (GİRİŞ)
             yeni = Attendance(person_id=person_id, name=name, entry_time=now)
             db.session.add(yeni)
             db.session.commit()
-            flash(f"📸 {name} için giriş fotoğrafı çekildi.")
         else:
             if last_record and last_record.exit_time is None:
                 last_record.exit_time = now
                 last_record.duration = last_record.exit_time - last_record.entry_time
                 db.session.commit()
-                # İSİMLİ ALERT MESAJI (ÇIKIŞ)
-                flash(f"📸 {name} için çıkış fotoğrafı çekildi.")
-            else:
-                flash(f"{name} için açık giriş kaydı bulunamadı.")
-    else:
-        flash("Yüz tanınamadı.")
     return redirect(url_for('home'))
 
 # ----------------- MAIN -----------------
