@@ -42,8 +42,8 @@ class Attendance(db.Model):
     exit_time = db.Column(db.DateTime)
     duration = db.Column(db.Interval)
 
-with app.app_context():
-    db.create_all()
+# with app.app_context():
+    # db.create_all()
 
 # Sağlık kontrolü
 @app.route("/health")
