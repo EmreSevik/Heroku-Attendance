@@ -1,3 +1,4 @@
+# app.py
 from flask import Flask, render_template_string, request, redirect, url_for, flash
 from flask_sqlalchemy import SQLAlchemy
 from datetime import datetime, timedelta
@@ -7,6 +8,11 @@ from PIL import Image
 import numpy as np
 import face_recognition
 
+# --- Flask app ---
+app = Flask(__name__)
+app.config["TEMPLATES_AUTO_RELOAD"] = True
+app.secret_key = os.environ.get("SECRET_KEY", "yoklama123")
+
 # --- DB URL (Heroku + local fallback) ---
 db_url = os.environ.get("DATABASE_URL")
 if db_url and db_url.startswith("postgres://"):
@@ -14,20 +20,20 @@ if db_url and db_url.startswith("postgres://"):
 if not db_url:
     db_url = "sqlite:///app.db"  # add-on yoksa SQLite kullan
 
-# --- Flask app ---
-app = Flask(__name__)
-app.secret_key = os.environ.get("SECRET_KEY", "yoklama123")
 app.config["SQLALCHEMY_DATABASE_URI"] = db_url
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+
+# Heroku Postgres çoğunlukla SSL ister
+if db_url.startswith("postgresql://"):
+    app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {
+        "connect_args": {"sslmode": "require"},
+        "pool_pre_ping": True,
+    }
 
 # --- DB ---
 db = SQLAlchemy(app)
 
-# Uygulama import edilirken DB yaratma = kötü fikir; crash sebebi olur.
-# Bunu kaldır:
-# with app.app_context():
-#     db.create_all()
-
+# Model
 class Attendance(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     person_id = db.Column(db.String(32))
@@ -38,6 +44,18 @@ class Attendance(db.Model):
 
 with app.app_context():
     db.create_all()
+
+# Sağlık kontrolü
+@app.route("/health")
+def health():
+    return "OK", 200
+
+# İlk tablo kurulumu (isteğe bağlı)
+@app.route("/initdb")
+def initdb():
+    with app.app_context():
+        db.create_all()
+    return "DB OK", 200
 
 # ----------------- ORTAK STİL (tek mavi tema) -----------------
 BASE_CSS = """
@@ -135,7 +153,7 @@ HOME_HTML = f'''
           <!-- Sol: Canlı Kamera -->
           <div class="col-12 col-lg-5">
             <div class="cam-card">
-              <video id="video" autoplay></video>
+              <video id="video" autoplay playsinline></video>
               <div class="mt-3 d-flex gap-2 justify-content-center">
                 <button id="snap" class="btn btn-primary">📸 Fotoğraf Çek</button>
                 <form id="photoForm" method="POST" enctype="multipart/form-data" class="d-inline">
@@ -163,9 +181,17 @@ HOME_HTML = f'''
       document.getElementById('sendBtn').disabled = true;
       const form = document.getElementById('photoForm');
       form.action = (type === 'entrance') ? '/attendance_photo' : '/exit_photo';
-      navigator.mediaDevices.getUserMedia({{ video: true }}).then(stream => {{
-        document.getElementById('video').srcObject = stream;
-      }});
+
+      // https gerektirir (Heroku prod'da tamam)
+      navigator.mediaDevices.getUserMedia({{ video: true }})
+        .then(stream => {{
+          const v = document.getElementById('video');
+          v.srcObject = stream;
+        }})
+        .catch(err => {{
+          alert('Kamera erişimi reddedildi: ' + err);
+        }});
+
       document.getElementById('cameraArea').scrollIntoView({{behavior:'smooth', block:'center'}});
     }}
 
@@ -338,7 +364,7 @@ def add_user():
         names.append(username)
         ids.append(new_id)
         with open("face_db.pickle", "wb") as f:
-          pickle.dump((encodings, names, ids), f)
+            pickle.dump((encodings, names, ids), f)
         os.remove(path)
         flash(f"Kullanıcı eklendi: {username} (ID: {new_id})")
         return redirect(url_for('add_user'))
@@ -359,7 +385,12 @@ def process_photo(is_entry: bool):
         flash("Fotoğraf alınamadı.")
         return redirect(url_for('home'))
 
-    img_bytes = base64.b64decode(img_data.split(',')[1])
+    try:
+        img_bytes = base64.b64decode(img_data.split(',')[1])
+    except Exception:
+        flash("Görsel çözümleme hatası.")
+        return redirect(url_for('home'))
+
     image = Image.open(BytesIO(img_bytes)).convert("RGB")
     img_array = np.array(image)
 
@@ -412,5 +443,6 @@ def process_photo(is_entry: bool):
 
 # ----------------- MAIN -----------------
 if __name__ == '__main__':
-    # prod: app.run(host="0.0.0.0", port=5000)
-    app.run(debug=True)
+    # Lokal geliştirme için. Heroku'da Gunicorn Procfile ile başlatır.
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
