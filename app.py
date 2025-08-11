@@ -1,5 +1,5 @@
 # app.py
-from flask import Flask, render_template_string, request, redirect, url_for
+from flask import Flask, render_template_string, request, redirect, url_for, jsonify
 from flask_sqlalchemy import SQLAlchemy
 from datetime import datetime, timedelta
 import pickle, os
@@ -41,6 +41,23 @@ class Attendance(db.Model):
     entry_time = db.Column(db.DateTime)
     exit_time = db.Column(db.DateTime)
     duration = db.Column(db.Interval)
+
+# ------------- CONFIDENCE HESAPLAMA -------------
+def face_confidence(face_distance, match_threshold=0.45):
+    """
+    face_distance -> face_recognition.face_distance() çıktısı
+    match_threshold -> compare_faces(tolerance) ile uyumlu eşik
+    Çıktı: yüzdelik güven skoru (0-100)
+    """
+    range_val = (1.0 - match_threshold)
+    linear_val = (1.0 - face_distance) / (range_val * 2.0)
+
+    if face_distance > match_threshold:
+        return round(max(0.0, min(1.0, linear_val)) * 100, 2)
+    else:
+        # Yakın mesafelerde daha keskin yükselen bir eğri
+        value = (linear_val + ((1.0 - linear_val) * pow((linear_val - 0.5) * 2, 0.2)))
+        return round(max(0.0, min(1.0, value)) * 100, 2)
 
 # Sağlık kontrolü
 @app.route("/health")
@@ -237,13 +254,24 @@ HOME_HTML = f'''
 
           try {{
             const res = await fetch(url, {{ method: 'POST', body: fd }});
+            const ct = res.headers.get('content-type') || '';
             if (!res.ok) {{
               const txt = await res.text();
               alert("Gönderim hatası: " + res.status + " " + txt);
               return;
             }}
-            // ✅ Başarılı: kullanıcıya uyarı ver ve ana sayfaya dön
-            alert('📸 Fotoğraf çekildi.');
+            if (ct.includes('application/json')) {{
+              const data = await res.json();
+              // ✅ Sonucu kullanıcıya göster
+              if (data && data.name) {{
+                alert('📸 ' + (data.action || 'İşlem') + ' → ' + data.name);
+              }} else {{
+                alert('📸 Fotoğraf çekildi.');
+              }}
+            }} else {{
+              alert('📸 Fotoğraf çekildi.');
+            }}
+            // Ana sayfaya dön
             window.location.href = "/";
           }} catch (err) {{
             alert("Ağ hatası: " + err);
@@ -417,47 +445,87 @@ def exit_photo():
 def process_photo(is_entry: bool):
     """
     Yeni yöntem: JPEG Blob (multipart/form-data) bekler: field adı 'photo'
+    JSON döner: {status, action, name, confidence, recognized, person_id?}
     """
     file = request.files.get('photo')
     if not file:
-        return redirect(url_for('home'))
+        return jsonify({"status": "error", "message": "No photo"}), 400
 
     try:
         image = Image.open(file.stream).convert("RGB")
     except Exception:
-        return redirect(url_for('home'))
+        return jsonify({"status": "error", "message": "Invalid image"}), 400
 
     img_array = np.array(image)
 
     face_locs = face_recognition.face_locations(img_array)
     if not face_locs:
-        return redirect(url_for('home'))
+        return jsonify({
+            "status": "ok",
+            "action": "Görüntü",
+            "name": "Yüz bulunamadı",
+            "confidence": 0.0,
+            "recognized": False
+        }), 200
 
     face_enc = face_recognition.face_encodings(img_array, face_locs)[0]
 
     if not os.path.exists("face_db.pickle"):
-        return redirect(url_for('home'))
+        return jsonify({
+            "status": "ok",
+            "action": "Görüntü",
+            "name": "Veritabanı boş",
+            "confidence": 0.0,
+            "recognized": False
+        }), 200
 
     with open("face_db.pickle", "rb") as f:
         known_encodings, known_names, known_ids = pickle.load(f)
 
-    matches = face_recognition.compare_faces(known_encodings, face_enc, tolerance=0.45)
-    if True in matches:
-        idx = matches.index(True)
-        name = known_names[idx]
-        person_id = known_ids[idx]
+    # Eşik (tolerance) ve confidence uyumlu
+    tolerance = 0.45
+    distances = face_recognition.face_distance(known_encodings, face_enc)
+
+    if len(distances) == 0:
+        return jsonify({
+            "status": "ok",
+            "action": "Görüntü",
+            "name": "Kayıtlı kişi yok",
+            "confidence": 0.0,
+            "recognized": False
+        }), 200
+
+    best_idx = int(np.argmin(distances))
+    best_dist = float(distances[best_idx])
+    conf = face_confidence(best_dist, match_threshold=tolerance)  # % değer
+
+    is_match = best_dist <= tolerance
+    action_text = "Giriş" if is_entry else "Çıkış"
+
+    if is_match:
+        name_only = known_names[best_idx]
+        person_id = known_ids[best_idx]
         now = datetime.now()
 
+        # 2 saat kuralı
         last_record = Attendance.query.filter_by(person_id=person_id).order_by(Attendance.entry_time.desc()).first()
-        # 2 saat içinde aynı işlem tekrarı engeli
         if last_record and (
             (is_entry and last_record.entry_time and (now - last_record.entry_time) < timedelta(hours=2)) or
-            (not is_entry and last_record.exit_time and (now - last_record.exit_time) < timedelta(hours=2))
+            ((not is_entry) and last_record.exit_time and (now - last_record.exit_time) < timedelta(hours=2))
         ):
-            return redirect(url_for('home'))
+            # Eşleşme var ama tekrar işlem
+            return jsonify({
+                "status": "ok",
+                "action": action_text,
+                "name": f"{name_only} ({conf}%) - Tekrarlı işlem engellendi",
+                "confidence": conf,
+                "recognized": True,
+                "person_id": person_id
+            }), 200
 
+        # Kayıt yaz
         if is_entry:
-            yeni = Attendance(person_id=person_id, name=name, entry_time=now)
+            yeni = Attendance(person_id=person_id, name=name_only, entry_time=now)
             db.session.add(yeni)
             db.session.commit()
         else:
@@ -465,7 +533,25 @@ def process_photo(is_entry: bool):
                 last_record.exit_time = now
                 last_record.duration = last_record.exit_time - last_record.entry_time
                 db.session.commit()
-    return redirect(url_for('home'))
+
+        return jsonify({
+            "status": "ok",
+            "action": action_text,
+            "name": f"{name_only} ({conf}%)",
+            "confidence": conf,
+            "recognized": True,
+            "person_id": person_id
+        }), 200
+
+    else:
+        # Eşleşme yok
+        return jsonify({
+            "status": "ok",
+            "action": action_text,
+            "name": f"Unknown ({conf}%)",
+            "confidence": conf,
+            "recognized": False
+        }), 200
 
 # ----------------- MAIN -----------------
 if __name__ == '__main__':
