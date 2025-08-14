@@ -1,39 +1,36 @@
-# app.py
-from flask import Flask, render_template_string, request, redirect, url_for, jsonify
+from flask import Flask, render_template_string, request, redirect, url_for, flash
 from flask_sqlalchemy import SQLAlchemy
 from datetime import datetime, timedelta
-import pickle, os
+import pickle, base64, os
+from io import BytesIO
 from PIL import Image
 import numpy as np
 import face_recognition
 
-# --- Flask app ---
+# --- YOLO: sadece yüz TESPİTİ için kullanıyoruz ---
+from ultralytics import YOLO
+
+# ================== AYARLAR ==================
+# YOLO model dosya yolu (örn: "runs/detect/train/weights/best.pt")
+YOLO_MODEL_PATH = os.environ.get("YOLO_MODEL_PATH", "/Users/apple/Documents/GitHub/Heroku-Attendance/best.pt")
+YOLO_CONF = 0.45  # tespit eşiği
+
+# Modelinde birden fazla sınıf varsa ve yüz sınıfının adını biliyorsan doldur:
+# Örn: {"face", "person_face"}
+YOLO_FACE_CLASS_NAMES = None  # Sadece yüz sınıflarını bırakmak için set ver (yoksa tüm box'ları yüz varsayar)
+
+# face_recognition karşılaştırma eşiği (daha küçük = daha katı)
+FR_TOLERANCE = 0.45
+# =============================================
+
 app = Flask(__name__)
-app.secret_key = os.environ.get("SECRET_KEY", "yoklama123")
-app.config["TEMPLATES_AUTO_RELOAD"] = True
-app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024  # 10MB payload limiti
+app.secret_key = 'yoklama123'
 
-# --- DB URL (Heroku + local fallback) ---
-db_url = os.environ.get("DATABASE_URL")
-if db_url and db_url.startswith("postgres://"):
-    db_url = db_url.replace("postgres://", "postgresql://", 1)
-if not db_url:
-    db_url = "sqlite:///app.db"  # add-on yoksa SQLite kullan (ephemeral)
-
-app.config["SQLALCHEMY_DATABASE_URI"] = db_url
-app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
-
-# Heroku Postgres çoğunlukla SSL ister
-if db_url.startswith("postgresql://"):
-    app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {
-        "connect_args": {"sslmode": "require"},
-        "pool_pre_ping": True,
-    }
-
-# --- DB ---
+# PostgreSQL örneği
+app.config['SQLALCHEMY_DATABASE_URI'] = 'postgresql://emre:1234@localhost/attendance_db'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db = SQLAlchemy(app)
 
-# Model
 class Attendance(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     person_id = db.Column(db.String(32))
@@ -42,34 +39,16 @@ class Attendance(db.Model):
     exit_time = db.Column(db.DateTime)
     duration = db.Column(db.Interval)
 
-# ------------- CONFIDENCE HESAPLAMA -------------
-def face_confidence(face_distance, match_threshold=0.45):
-    """
-    face_distance -> face_recognition.face_distance() çıktısı
-    match_threshold -> compare_faces(tolerance) ile uyumlu eşik
-    Çıktı: yüzdelik güven skoru (0-100)
-    """
-    range_val = (1.0 - match_threshold)
-    linear_val = (1.0 - face_distance) / (range_val * 2.0)
+with app.app_context():
+    db.create_all()
 
-    if face_distance > match_threshold:
-        return round(max(0.0, min(1.0, linear_val)) * 100, 2)
-    else:
-        # Yakın mesafelerde daha keskin yükselen bir eğri
-        value = (linear_val + ((1.0 - linear_val) * pow((linear_val - 0.5) * 2, 0.2)))
-        return round(max(0.0, min(1.0, value)) * 100, 2)
-
-# Sağlık kontrolü
-@app.route("/health")
-def health():
-    return "OK", 200
-
-# İlk tablo kurulumu – sadece elle çağır
-@app.route("/initdb")
-def initdb():
-    with app.app_context():
-        db.create_all()
-    return "DB OK", 200
+# --- YOLO modeli yükle ---
+try:
+    yolo_model = YOLO(YOLO_MODEL_PATH)
+    print(f"[INFO] YOLO yüklendi: {YOLO_MODEL_PATH}")
+except Exception as e:
+    yolo_model = None
+    print(f"[WARN] YOLO modeli yüklenemedi: {e}")
 
 # ----------------- ORTAK STİL (tek mavi tema) -----------------
 BASE_CSS = """
@@ -96,8 +75,7 @@ BASE_CSS = """
   }
   .sq-in{ background:var(--in); color:#fff; } .sq-in:hover{ background:var(--inH); }
   .sq-out{ background:var(--out); color:#fff; } .sq-out:hover{ background:var(--outH); }
-
-  /* Kamera alanı: yan yana yerleşim + responsive */
+  .alert{ border-radius:12px; }
   #cameraArea{ display:none; margin-top:30px; }
   .cam-row{ gap:1.25rem; }
   .cam-card{
@@ -107,15 +85,6 @@ BASE_CSS = """
   #video, #preview{
     border-radius:12px; width:100%; height:auto;
     aspect-ratio:16/9; object-fit:cover; max-height:420px;
-  }
-
-  /* (Görsel) Flaş efekti */
-  #flashEffect{
-    display:none; position:fixed; inset:0; background:#fff; z-index:9999; opacity:1;
-    animation: flash-pop .25s ease;
-  }
-  @keyframes flash-pop{
-    0%{opacity:1} 100%{opacity:0}
   }
 </style>
 """
@@ -132,7 +101,6 @@ HOME_HTML = f'''
   {BASE_CSS}
 </head>
 <body>
-  <div id="flashEffect"></div>
   <div class="page-wrap">
     <nav class="navbar navbar-expand px-3">
       <div class="container-fluid">
@@ -145,7 +113,15 @@ HOME_HTML = f'''
     </nav>
 
     <main class="container py-4">
-      <!-- Giriş/Çıkış büyük butonlar -->
+      {{% with messages = get_flashed_messages() %}}
+        {{% if messages %}}
+          <div class="alert alert-success alert-dismissible fade show" role="alert">
+            {{{{ messages[0] }}}}
+            <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+          </div>
+        {{% endif %}}
+      {{% endwith %}}
+
       <div class="hero">
         <button class="big-square sq-in border-0" onclick="startCamera('entrance')">
           <div class="text-center">
@@ -161,24 +137,20 @@ HOME_HTML = f'''
         </button>
       </div>
 
-      <!-- Kamera Alanı (YAN YANA) -->
       <div id="cameraArea" class="container" style="display:none; margin-top:30px;">
         <div class="row cam-row justify-content-center align-items-start">
-          <!-- Sol: Canlı Kamera -->
           <div class="col-12 col-lg-5">
             <div class="cam-card">
-              <video id="video" autoplay playsinline></video>
+              <video id="video" autoplay></video>
               <div class="mt-3 d-flex gap-2 justify-content-center">
-                <button id="snap" class="btn btn-primary">📸 Fotoğraf Çek & Kaydet</button>
-                <!-- Form sadece action bilgisini taşımak için var; gönderim fetch ile -->
-                <form id="photoForm" class="d-inline">
-                  <input type="hidden" name="action" id="currentAction" value="/attendance_photo">
+                <button id="snap" class="btn btn-primary">📸 Fotoğraf Çek</button>
+                <form id="photoForm" method="POST" enctype="multipart/form-data" class="d-inline">
+                  <input type="hidden" name="imgData" id="imgData">
+                  <button type="submit" class="btn btn-success" id="sendBtn" disabled>Kaydet</button>
                 </form>
               </div>
             </div>
           </div>
-
-          <!-- Sağ: Önizleme -->
           <div class="col-12 col-lg-5">
             <div class="cam-card">
               <img id="preview" src="" style="display:none;">
@@ -192,92 +164,33 @@ HOME_HTML = f'''
   <script>
     function startCamera(type) {{
       document.getElementById('cameraArea').style.display = 'block';
-
-      // action'ı ayarla
-      const act = (type === 'entrance') ? '/attendance_photo' : '/exit_photo';
-      document.getElementById('currentAction').value = act;
-
-      // 640p hedef çözünürlük
-      navigator.mediaDevices.getUserMedia({{
-        video: {{ width: {{ ideal: 640 }}, height: {{ ideal: 360 }}, facingMode: "user" }}
-      }})
-      .then(stream => {{
-        const v = document.getElementById('video');
-        v.srcObject = stream;
-      }})
-      .catch(err => {{
-        alert('Kamera erişimi reddedildi: ' + err);
+      document.getElementById('sendBtn').disabled = true;
+      const form = document.getElementById('photoForm');
+      form.action = (type === 'entrance') ? '/attendance_photo' : '/exit_photo';
+      navigator.mediaDevices.getUserMedia({{ video: true }}).then(stream => {{
+        document.getElementById('video').srcObject = stream;
       }});
-
       document.getElementById('cameraArea').scrollIntoView({{behavior:'smooth', block:'center'}});
     }}
 
     document.addEventListener('DOMContentLoaded', () => {{
       const snap = document.getElementById('snap');
-      if (!snap) return;
-
-      snap.onclick = async function(e) {{
-        e.preventDefault();
-        const video = document.getElementById('video');
-        const W = 640;
-        const vw = video.videoWidth || 960;
-        const vh = video.videoHeight || 540;
-        const H = Math.round(W * vh / vw); // en-boy oranını koru
-
-        const canvas = document.createElement('canvas');
-        canvas.width = W; canvas.height = H;
-        const ctx = canvas.getContext('2d');
-        ctx.drawImage(video, 0, 0, W, H);
-
-        // Görsel flaş efekti
-        const fx = document.getElementById('flashEffect');
-        fx.style.display = 'block';
-        setTimeout(() => fx.style.display = 'none', 200);
-
-        // JPEG + kalite düşür (0.7)
-        canvas.toBlob(async (blob) => {{
-          if (!blob) {{
-            alert("Görüntü yakalanamadı.");
-            return;
-          }}
-
-          // Önizleme
+      if (snap) {{
+        snap.onclick = function(e) {{
+          e.preventDefault();
+          var canvas = document.createElement('canvas');
+          var video = document.getElementById('video');
+          canvas.width = video.videoWidth || 960;
+          canvas.height = video.videoHeight || 540;
+          canvas.getContext('2d').drawImage(video, 0, 0);
+          var dataUrl = canvas.toDataURL('image/png');
+          document.getElementById('imgData').value = dataUrl;
           const prev = document.getElementById('preview');
-          prev.src = URL.createObjectURL(blob);
-          prev.style.display = 'block';
-
-          // FormData + Blob gönder
-          const fd = new FormData();
-          fd.append('photo', blob, 'frame.jpg');
-
-          const url = document.getElementById('currentAction').value;
-
-          try {{
-            const res = await fetch(url, {{ method: 'POST', body: fd }});
-            const ct = res.headers.get('content-type') || '';
-            if (!res.ok) {{
-              const txt = await res.text();
-              alert("Gönderim hatası: " + res.status + " " + txt);
-              return;
-            }}
-            if (ct.includes('application/json')) {{
-              const data = await res.json();
-              // ✅ Sonucu kullanıcıya göster
-              if (data && data.name) {{
-                alert('📸 ' + (data.action || 'İşlem') + ' → ' + data.name);
-              }} else {{
-                alert('📸 Fotoğraf çekildi.');
-              }}
-            }} else {{
-              alert('📸 Fotoğraf çekildi.');
-            }}
-            // Ana sayfaya dön
-            window.location.href = "/";
-          }} catch (err) {{
-            alert("Ağ hatası: " + err);
-          }}
-        }}, 'image/jpeg', 0.7);
-      }};
+          prev.src = dataUrl; prev.style.display = 'block';
+          document.getElementById('sendBtn').disabled = false;
+          alert("📸 Fotoğraf çekildi!");
+        }};
+      }}
     }});
   </script>
   <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
@@ -362,6 +275,15 @@ ADD_USER_HTML = f'''
     </nav>
 
     <main class="container py-4">
+      {{% with messages = get_flashed_messages() %}}
+        {{% if messages %}}
+          <div class="alert alert-success alert-dismissible fade show" role="alert">
+            {{{{ messages[0] }}}}
+            <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+          </div>
+        {{% endif %}}
+      {{% endwith %}}
+
       <div class="card p-4" style="background:#fff; border:1px solid #e6eefc; border-radius:16px;">
         <h3 class="mb-3">Add New User</h3>
         <form method="post" enctype="multipart/form-data">
@@ -396,27 +318,20 @@ def dashboard():
 @app.route('/add_user', methods=['GET', 'POST'])
 def add_user():
     if request.method == 'POST':
-        username = request.form.get('username', '').strip()
+        username = request.form['username']
         file = request.files.get('face_image')
-        if not username:
-            return redirect(url_for('add_user'))
         if not file:
+            flash("Fotoğraf yüklenmedi.")
             return redirect(url_for('add_user'))
-
-        # Görseli yükle ve encode çıkar
-        try:
-            img = Image.open(file.stream).convert("RGB")
-        except Exception:
-            return redirect(url_for('add_user'))
-
-        img_np = np.array(img)
-        face_locs = face_recognition.face_locations(img_np)
+        path = f"tmp_{username}.jpg"
+        file.save(path)
+        img = face_recognition.load_image_file(path)  # RGB np.array
+        face_locs = face_recognition.face_locations(img)
         if not face_locs:
+            os.remove(path)
+            flash("Yüz algılanamadı.")
             return redirect(url_for('add_user'))
-
-        enc = face_recognition.face_encodings(img_np, face_locs)[0]
-
-        # Basit pickle veritabanı (ephemeral). Kalıcı istersen tabloya taşıyabiliriz.
+        enc = face_recognition.face_encodings(img, face_locs)[0]
         if os.path.exists("face_db.pickle"):
             with open("face_db.pickle", "rb") as f:
                 encodings, names, ids = pickle.load(f)
@@ -428,12 +343,56 @@ def add_user():
         ids.append(new_id)
         with open("face_db.pickle", "wb") as f:
             pickle.dump((encodings, names, ids), f)
-
+        os.remove(path)
+        flash(f"Kullanıcı eklendi: {username} (ID: {new_id})")
         return redirect(url_for('add_user'))
-
     return render_template_string(ADD_USER_HTML)
 
-# ----------------- FOTOĞRAF İŞLEME -----------------
+# --------- YOLO ile YÜZ TESPİTİ yardımcıları ---------
+def detect_faces_yolo(img_rgb: np.ndarray):
+    """
+    Ultralytics YOLO'dan gelen kutuları face_recognition formatına çevirir.
+    face_recognition: (top, right, bottom, left)
+    YOLO: (x1, y1, x2, y2)
+    """
+    if yolo_model is None:
+        return []
+
+    # YOLO tahmini
+    results = yolo_model.predict(img_rgb, conf=YOLO_CONF, verbose=False)
+    if not results or len(results) == 0:
+        return []
+
+    boxes = []
+    res = results[0]
+    if res.boxes is None or len(res.boxes) == 0:
+        return []
+
+    # Sınıf filtresi gerekiyorsa uygula
+    # (Ultralytics'te class isimleri res.names içinde tutulur)
+    names_map = getattr(res, "names", None)  # dict: class_id -> class_name
+    for i in range(len(res.boxes)):
+        b = res.boxes[i]
+        x1, y1, x2, y2 = b.xyxy[0].tolist()
+        cls_ok = True
+        if YOLO_FACE_CLASS_NAMES and names_map is not None:
+            cls_id = int(b.cls[0].item()) if b.cls is not None else None
+            cls_name = names_map.get(cls_id, None) if cls_id is not None else None
+            cls_ok = cls_name in YOLO_FACE_CLASS_NAMES
+        if not cls_ok:
+            continue
+
+        h, w = img_rgb.shape[:2]
+        x1 = max(0, min(int(x1), w-1))
+        x2 = max(0, min(int(x2), w-1))
+        y1 = max(0, min(int(y1), h-1))
+        y2 = max(0, min(int(y2), h-1))
+        top, right, bottom, left = y1, x2, y2, x1
+        boxes.append((top, right, bottom, left))
+
+    return boxes
+
+# ----------------- FOTOĞRAF İŞLEME (YOLO tespit + FR tanıma) -----------------
 @app.route('/attendance_photo', methods=['POST'])
 def attendance_photo():
     return process_photo(is_entry=True)
@@ -443,118 +402,78 @@ def exit_photo():
     return process_photo(is_entry=False)
 
 def process_photo(is_entry: bool):
-    """
-    Yeni yöntem: JPEG Blob (multipart/form-data) bekler: field adı 'photo'
-    JSON döner: {status, action, name, confidence, recognized, person_id?}
-    """
-    file = request.files.get('photo')
-    if not file:
-        return jsonify({"status": "error", "message": "No photo"}), 400
+    img_data = request.form.get('imgData')
+    if not img_data:
+        flash("Fotoğraf alınamadı.")
+        return redirect(url_for('home'))
 
-    try:
-        image = Image.open(file.stream).convert("RGB")
-    except Exception:
-        return jsonify({"status": "error", "message": "Invalid image"}), 400
+    img_bytes = base64.b64decode(img_data.split(',')[1])
+    image = Image.open(BytesIO(img_bytes)).convert("RGB")
+    img_rgb = np.array(image)  # face_recognition RGB ister
 
-    img_array = np.array(image)
+    # 1) YOLO ile yüz kutularını bul
+    face_locs = detect_faces_yolo(img_rgb)
 
-    face_locs = face_recognition.face_locations(img_array)
     if not face_locs:
-        return jsonify({
-            "status": "ok",
-            "action": "Görüntü",
-            "name": "Yüz bulunamadı",
-            "confidence": 0.0,
-            "recognized": False
-        }), 200
+        flash("Yüz algılanamadı (YOLO).")
+        return redirect(url_for('home'))
 
-    face_enc = face_recognition.face_encodings(img_array, face_locs)[0]
+    # 2) Kutulardan embedding çıkar
+    face_encs = face_recognition.face_encodings(img_rgb, face_locs)
+    if not face_encs:
+        flash("Yüz embedding çıkarılamadı.")
+        return redirect(url_for('home'))
 
+    # 3) Veritabanı yükle
     if not os.path.exists("face_db.pickle"):
-        return jsonify({
-            "status": "ok",
-            "action": "Görüntü",
-            "name": "Veritabanı boş",
-            "confidence": 0.0,
-            "recognized": False
-        }), 200
+        flash("Yüz veritabanı yok.")
+        return redirect(url_for('home'))
 
     with open("face_db.pickle", "rb") as f:
         known_encodings, known_names, known_ids = pickle.load(f)
 
-    # Eşik (tolerance) ve confidence uyumlu
-    tolerance = 0.45
-    distances = face_recognition.face_distance(known_encodings, face_enc)
+    # 4) Her yüz için eşleşme dene (ilk bulunan eşleşme ile devam)
+    matched = None
+    for enc in face_encs:
+        matches = face_recognition.compare_faces(known_encodings, enc, tolerance=FR_TOLERANCE)
+        if True in matches:
+            idx = matches.index(True)
+            matched = (known_ids[idx], known_names[idx])
+            break
 
-    if len(distances) == 0:
-        return jsonify({
-            "status": "ok",
-            "action": "Görüntü",
-            "name": "Kayıtlı kişi yok",
-            "confidence": 0.0,
-            "recognized": False
-        }), 200
+    if not matched:
+        flash("Yüz tanınamadı (eşleşme yok).")
+        return redirect(url_for('home'))
 
-    best_idx = int(np.argmin(distances))
-    best_dist = float(distances[best_idx])
-    conf = face_confidence(best_dist, match_threshold=tolerance)  # % değer
+    person_id, name = matched
+    now = datetime.now()
 
-    is_match = best_dist <= tolerance
-    action_text = "Giriş" if is_entry else "Çıkış"
+    last_record = Attendance.query.filter_by(person_id=person_id).order_by(Attendance.entry_time.desc()).first()
+    # 2 saat içinde tekrar aynı işlem engeli
+    if last_record and (
+        (is_entry and last_record.entry_time and (now - last_record.entry_time) < timedelta(hours=2)) or
+        (not is_entry and last_record.exit_time and (now - last_record.exit_time) < timedelta(hours=2))
+    ):
+        flash(f"{name}, 2 saat içinde tekrar kayıt yapılamaz.")
+        return redirect(url_for('home'))
 
-    if is_match:
-        name_only = known_names[best_idx]
-        person_id = known_ids[best_idx]
-        now = datetime.now()
-
-        # 2 saat kuralı
-        last_record = Attendance.query.filter_by(person_id=person_id).order_by(Attendance.entry_time.desc()).first()
-        if last_record and (
-            (is_entry and last_record.entry_time and (now - last_record.entry_time) < timedelta(hours=2)) or
-            ((not is_entry) and last_record.exit_time and (now - last_record.exit_time) < timedelta(hours=2))
-        ):
-            # Eşleşme var ama tekrar işlem
-            return jsonify({
-                "status": "ok",
-                "action": action_text,
-                "name": f"{name_only} ({conf}%) - Tekrarlı işlem engellendi",
-                "confidence": conf,
-                "recognized": True,
-                "person_id": person_id
-            }), 200
-
-        # Kayıt yaz
-        if is_entry:
-            yeni = Attendance(person_id=person_id, name=name_only, entry_time=now)
-            db.session.add(yeni)
-            db.session.commit()
-        else:
-            if last_record and last_record.exit_time is None:
-                last_record.exit_time = now
-                last_record.duration = last_record.exit_time - last_record.entry_time
-                db.session.commit()
-
-        return jsonify({
-            "status": "ok",
-            "action": action_text,
-            "name": f"{name_only} ({conf}%)",
-            "confidence": conf,
-            "recognized": True,
-            "person_id": person_id
-        }), 200
-
+    if is_entry:
+        yeni = Attendance(person_id=person_id, name=name, entry_time=now)
+        db.session.add(yeni)
+        db.session.commit()
+        flash(f"Hoş geldin {name}, giriş kaydedildi.")
     else:
-        # Eşleşme yok
-        return jsonify({
-            "status": "ok",
-            "action": action_text,
-            "name": f"Unknown ({conf}%)",
-            "confidence": conf,
-            "recognized": False
-        }), 200
+        if last_record and last_record.exit_time is None:
+            last_record.exit_time = now
+            last_record.duration = last_record.exit_time - last_record.entry_time
+            db.session.commit()
+            flash(f"Güle güle {name}, çıkış kaydedildi.")
+        else:
+            flash(f"{name} için açık giriş kaydı bulunamadı.")
+
+    return redirect(url_for('home'))
 
 # ----------------- MAIN -----------------
 if __name__ == '__main__':
-    # Lokal geliştirme için. Heroku'da Gunicorn Procfile ile başlatır.
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=True)
+    # prod: app.run(host="0.0.0.0", port=5000)
+    app.run(debug=True)
