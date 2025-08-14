@@ -66,7 +66,25 @@ class Attendance(db.Model):
     exit_time = db.Column(db.DateTime)
     duration = db.Column(db.Interval)
     yolo_conf = db.Column(db.Float)         # YOLO tespit güveni
-    recog_conf = db.Column(db.Float)        # yüz tanıma güveni (%)
+    recog_conf = db.Column(db.Float)   
+
+
+# ADD: tek seferlik migration
+@app.route("/migrate_conf_cols")
+def migrate_conf_cols():
+    from sqlalchemy import text
+    try:
+        db.session.execute(text("""
+            ALTER TABLE attendance
+            ADD COLUMN IF NOT EXISTS yolo_conf double precision,
+            ADD COLUMN IF NOT EXISTS recog_conf double precision
+        """))
+        db.session.commit()
+        return "OK: columns ensured", 200
+    except Exception as e:
+        db.session.rollback()
+        return f"ERR: {e}", 500
+
 
 # ------------- CONFIDENCE HESAPLAMA (tanıma için) -------------
 def face_confidence(face_distance, match_threshold=0.45):
