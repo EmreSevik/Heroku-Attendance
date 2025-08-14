@@ -8,5 +8,4 @@ pillow
 opencv-python-headless
 pandas
 matplotlib
-scipy
 ultralytics
