@@ -1,15 +1,9 @@
 Flask
 Flask-SQLAlchemy
-gunicorn
 psycopg2-binary
-face_recognition
-numpy
-pillow
-opencv-python-headless
-pandas
-matplotlib
+gunicorn
 ultralytics
-scipy
-torch==2.2.0+cpu
-torchvision==0.17.0+cpu
---extra-index-url https://download.pytorch.org/whl/cpu
+opencv-python-headless
+face_recognition
+Pillow
+numpy
