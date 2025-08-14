@@ -5,6 +5,6 @@ face_recognition
 numpy
 pillow
 gunicorn
-ultralytics==8.2.0
+
 
 
