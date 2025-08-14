@@ -1,10 +1,9 @@
 Flask
 Flask-SQLAlchemy
 psycopg2-binary
-face_recognition
-numpy
-pillow
 gunicorn
-
-
-
+ultralytics
+opencv-python-headless
+face_recognition
+Pillow
+numpy
